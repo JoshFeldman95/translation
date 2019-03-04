@@ -60,11 +60,12 @@ class AttentionDecoder(ntorch.nn.Module):
             x, rnn_state = self.rnn(x, rnn_state)
         else:
             x, rnn_state = self.rnn(x)
-        context = x.dot('lstm', src).softmax('srcSeqlen').dot('srcSeqlen',src)
+        attn = x.dot('lstm', src).softmax('srcSeqlen')
+        context = attn.dot('srcSeqlen',src)
         x = self.out(ntorch.cat([context, x], dim = 'lstm'))
 
         # create new hidden state
-        hidden = {'src': src, 'rnn_state':rnn_state}
+        hidden = {'src': src, 'rnn_state':rnn_state, 'attn': attn}
         return x, hidden
 
 class Translator(ntorch.nn.Module):
@@ -72,31 +73,38 @@ class Translator(ntorch.nn.Module):
         super().__init__()
         self.teacher_forcing = teacher_forcing
         self.device = device
+        self.val_loss = float('inf')
+        self.to(device)
 
-    def forward(self, src, trg):
+    def forward(self, src, trg, teacher_forcing = None):
+        if teacher_forcing is None:
+            teacher_forcing = self.teacher_forcing
         #get src encoding
         hidden = self.encoder(src)
 
         # initialize outputs
         output_tokens = [trg[{'trgSeqlen':slice(0,1)}]]
         output_distributions = []
-
+        attn = []
         # make predictions
         for t in range(trg.shape['trgSeqlen']-1):
             #predict next word
-            if random.random() < self.teacher_forcing:
+            if random.random() < teacher_forcing:
                 inp = trg[{'trgSeqlen':slice(t,t+1)}]
                 out, hidden = self.decoder(inp, hidden)
             else:
                 out, hidden = self.decoder(output_tokens[t], hidden)
 
             #store output
+            if 'attn' in hidden:
+                attn.append(hidden['attn'])
             output_distributions.append(out)
             _, top1 = out.max("logit")
             output_tokens.append(top1)
 
         #format predictions
-        return ntorch.cat(output_distributions, dim = 'trgSeqlen')
+        return (ntorch.cat(output_distributions, dim = 'trgSeqlen'), ntorch.cat(attn, dim = 'trgSeqlen'))
+
 
     def fit(self, train_iter, val_iter=[], lr=1e-2, verbose=True,
         batch_size=128, epochs=10, interval=1, early_stopping=False):
@@ -113,7 +121,7 @@ class Translator(ntorch.nn.Module):
             for i, data in enumerate(train_iter, 0):
                 src, trg = data.src, data.trg
                 optimizer.zero_grad()
-                out = self(src, trg)
+                out, _ = self(src, trg)
                 loss = criterion(
                     out.transpose("batch", "logit", "trgSeqlen").values,
                     trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values,
@@ -133,7 +141,7 @@ class Translator(ntorch.nn.Module):
             self.eval()
             for i, data in enumerate(val_iter):
                 src, trg = data.src, data.trg
-                out = self(src, trg, teacher_forcing_ratio = 0)
+                out, _ = self(src, trg, teacher_forcing = 0)
                 loss = criterion(
                     out.transpose("batch", "logit", "trgSeqlen").values,
                     trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values
