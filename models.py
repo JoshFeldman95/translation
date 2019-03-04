@@ -3,103 +3,100 @@ from namedtensor import ntorch, NamedTensor
 import numpy as np
 import random
 
-# based on https://github.com/bentrevett/pytorch-seq2seq/blob/master/1%20-%20Sequence%20to%20Sequence%20Learning%20with%20Neural%20Networks.ipynb
 class LSTMEncoder(ntorch.nn.Module):
-    def __init__(self, DE, emb_dim, hid_dim, n_layers, dropout, attention = False):
+    def __init__(self, DE, emb_dim, hid_dim, n_layers, dropout, attention):
         super().__init__()
-
-        self.input_dim = len(DE.vocab)
-        self.emb_dim = emb_dim
-        self.hid_dim = hid_dim
-        self.n_layers = n_layers
-        self.dropout = dropout
         self.attention = attention
-
-        self.embedding = ntorch.nn.Embedding(self.input_dim, self.emb_dim).spec('srcSeqlen','embedding')
-        self.rnn = ntorch.nn.LSTM(self.emb_dim, self.hid_dim, self.n_layers, dropout=self.dropout).spec("embedding", "srcSeqlen", "lstm")
+        self.embedding = ntorch.nn.Embedding(len(DE.vocab), emb_dim).spec('srcSeqlen','embedding')
+        self.rnn = ntorch.nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout, bidirectional = self.attention).spec("embedding", "srcSeqlen", "lstm")
         self.dropout = ntorch.nn.Dropout(dropout)
 
-    def forward(self, x):
-        x = x[{'srcSeqlen':slice(-1,0)}]
-        x = self.dropout(self.embedding(x))
-        outputs, (hidden, cell) = self.rnn(x)
-        return hidden, cell
+    def forward(self, src):
+        if not self.attention:
+            # reverse input
+            src = src[{'srcSeqlen':slice(-1,0)}]
 
-class AttentionEncoder(ntorch.nn.Module):
-    def __init__(self, DE, emb_dim, hid_enc_dim, hid_dec_dim, en n_layers, dropout, attention = False):
-        super().__init__()
-
-        self.input_dim = len(DE.vocab)
-        self.emb_dim = emb_dim
-        self.hid_enc_dim = hid_dim
-        self.hid_dec_dim
-        self.n_layers = n_layers
-        self.dropout = dropout
-        self.attention = attention
-
-        self.embedding = ntorch.nn.Embedding(self.input_dim, self.emb_dim).spec('srcSeqlen','embedding')
-        self.rnn = (ntorch.nn.LSTM(self.emb_dim, self.hid_enc_dim, self.n_layers, dropout=self.dropout, bidirectional=True)
-        .spec("embedding", "srcSeqlen", "lstm_enc"))
-        self.fc = ntorch.linear(self.hid_enc_dim*2, self.hid_dec_dim).spec("lstm_enc", "lstm_dec")
-        self.dropout = ntorch.nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.embedding(x)
+        # run net
+        x = self.embedding(src)
         x = self.dropout(x)
-        outputs, (hidden, cell) = self.rnn(x)
-        return hidden, cell
+        outputs, hidden = self.rnn(x)
+        if self.attention:
+            return {'src':outputs}
+        else:
+            return hidden
 
 class LSTMDecoder(ntorch.nn.Module):
     def __init__(self, EN, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
-
-        self.emb_dim = emb_dim
-        self.hid_dim = hid_dim
-        self.output_dim = len(EN.vocab)
-        self.n_layers = n_layers
-        self.dropout = dropout
-
-        self.embedding = ntorch.nn.Embedding(self.output_dim, self.emb_dim).spec('trgSeqlen','embedding')
-
-        self.rnn = (ntorch.nn.LSTM(self.emb_dim, self.hid_dim, self.n_layers, dropout=self.dropout)
-                    .spec("embedding", "trgSeqlen", "lstm"))
-
-        self.out = ntorch.nn.Linear(self.hid_dim, self.output_dim).spec('lstm','out')
-
+        self.embedding = ntorch.nn.Embedding(len(EN.vocab), emb_dim).spec('trgSeqlen','embedding')
+        self.rnn = ntorch.nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout).spec("embedding", "trgSeqlen", "lstm")
+        self.out = ntorch.nn.Linear(hid_dim, len(EN.vocab)).spec("lstm", "logit")
         self.dropout = ntorch.nn.Dropout(dropout)
 
-    def forward(self, x, hidden, cell):
-        x = self.embedding(x)
+    def forward(self, trg, hidden):
+        x = self.embedding(trg)
         x = self.dropout(x)
-        x, (hidden, cell) = self.rnn(x, (hidden, cell))
-        x = self.dropout(x)
+        x, hidden = self.rnn(x, hidden)
         x = self.out(x)
-        return x, hidden, cell
+        return x, hidden
 
-class Seq2Seq(ntorch.nn.Module):
-    def __init__(self, encoder, decoder, device):
+class AttentionDecoder(ntorch.nn.Module):
+    def __init__(self, EN, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
+        self.embedding = ntorch.nn.Embedding(len(EN.vocab), emb_dim).spec('trgSeqlen','embedding')
+        self.rnn = ntorch.nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout).spec("embedding", "trgSeqlen", "lstm")
+        self.out = ntorch.nn.Linear(hid_dim*2, len(EN.vocab)).spec("lstm", "logit")
+        self.dropout = ntorch.nn.Dropout(dropout)
+
+    def forward(self, trg, hidden):
+        # get hidden state
+        src = hidden['src']
+        rnn_state = hidden['rnn_state'] if 'rnn_state' in hidden else None
+
+        #run net
+        x = self.embedding(trg)
+        x = self.dropout(x)
+        if rnn_state is not None:
+            x, rnn_state = self.rnn(x, rnn_state)
+        else:
+            x, rnn_state = self.rnn(x)
+        context = x.dot('lstm', src).softmax('srcSeqlen').dot('srcSeqlen',src)
+        x = self.out(ntorch.cat([context, x], dim = 'lstm'))
+
+        # create new hidden state
+        hidden = {'src': src, 'rnn_state':rnn_state}
+        return x, hidden
+
+class Translator(ntorch.nn.Module):
+    def __init__(self, teacher_forcing, device):
+        super().__init__()
+        self.teacher_forcing = teacher_forcing
         self.device = device
-        self.val_loss = float('inf')
 
-        assert encoder.hid_dim == decoder.hid_dim, "Hidden dimensions of encoder and decoder must be equal!"
-        assert encoder.n_layers == decoder.n_layers, "Encoder and decoder must have equal number of layers!"
+    def forward(self, src, trg):
+        #get src encoding
+        hidden = self.encoder(src)
 
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
-        outputs = torch.zeros(trg.shape['trgSeqlen']-1 trg.shape['batch'], self.decoder.output_dim).to(self.device)
+        # initialize outputs
+        output_tokens = [trg[{'trgSeqlen':slice(0,1)}]]
+        output_distributions = []
 
-        hidden, cell = self.encoder(src)
-
-        input = trg[{'trgSeqlen': slice(0,1)}]
+        # make predictions
         for t in range(trg.shape['trgSeqlen']-1):
-            output, hidden, cell = self.decoder(input, hidden, cell)
-            outputs[t] = output[{'trgSeqlen':0}].values
-            _, top1 = output.max("out")
-            input = (trg[{'trgSeqlen':slice(t,t+1)}] if random.random() < teacher_forcing_ratio else top1)
-        outputs = NamedTensor(outputs, names = ('trgSeqlen', 'batch', 'out'))
-        return outputs
+            #predict next word
+            if random.random() < self.teacher_forcing:
+                inp = trg[{'trgSeqlen':slice(t,t+1)}]
+                out, hidden = self.decoder(inp, hidden)
+            else:
+                out, hidden = self.decoder(output_tokens[t], hidden)
+
+            #store output
+            output_distributions.append(out)
+            _, top1 = out.max("logit")
+            output_tokens.append(top1)
+
+        #format predictions
+        return ntorch.cat(output_distributions, dim = 'trgSeqlen')
 
     def fit(self, train_iter, val_iter=[], lr=1e-2, verbose=True,
         batch_size=128, epochs=10, interval=1, early_stopping=False):
@@ -118,21 +115,17 @@ class Seq2Seq(ntorch.nn.Module):
                 optimizer.zero_grad()
                 out = self(src, trg)
                 loss = criterion(
-                    out.transpose("batch", "out", "trgSeqlen").values,
+                    out.transpose("batch", "logit", "trgSeqlen").values,
                     trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values,
                 )
                 loss.backward()
                 optimizer.step()
+                running_loss += loss.item()
 
                 # print statistics
-                running_loss += loss.item()
                 if i % interval == interval - 1:  # print every 2000 mini-batches
                     if verbose:
-                        print(
-                            "[epoch: {}, batch: {}] loss: {}".format(
-                                epoch + 1, i + 1, running_loss / interval
-                            )
-                        )
+                        print(f"[epoch: {epoch + 1}, batch: {i + 1}] loss: {running_loss / interval}")
                     running_loss = 0.0
 
             running_loss = 0.0
@@ -142,8 +135,8 @@ class Seq2Seq(ntorch.nn.Module):
                 src, trg = data.src, data.trg
                 out = self(src, trg, teacher_forcing_ratio = 0)
                 loss = criterion(
-                    out.transpose("batch", "out", "trgSeqlen").values,
-                    trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values,
+                    out.transpose("batch", "logit", "trgSeqlen").values,
+                    trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values
                 )
                 running_loss += loss.item()
                 val_count += 1
@@ -154,3 +147,15 @@ class Seq2Seq(ntorch.nn.Module):
             if self.val_loss > prev_loss and early_stopping:
                 break
             lr *= .8
+
+class LSTMTranslator(Translator):
+    def __init__(self, DE, EN, src_emb_dim, trg_emb_dim, hid_dim, n_layers = 4, dropout = 0.5, teacher_forcing = 0.75, device = 'cpu'):
+        super().__init__(teacher_forcing, device)
+        self.encoder = LSTMEncoder(DE, src_emb_dim, hid_dim, n_layers, dropout, False)
+        self.decoder = LSTMDecoder(EN, trg_emb_dim, hid_dim, n_layers, dropout)
+
+class AttentionTranslator(Translator):
+    def __init__(self, DE, EN, src_emb_dim, trg_emb_dim, hid_dim, n_layers = 4, dropout = 0.5, teacher_forcing = 0.75, device = 'cpu'):
+        super().__init__(teacher_forcing, device)
+        self.encoder = LSTMEncoder(DE, src_emb_dim, hid_dim, n_layers, dropout, True)
+        self.decoder = AttentionDecoder(EN, trg_emb_dim, hid_dim*2, n_layers, dropout)
