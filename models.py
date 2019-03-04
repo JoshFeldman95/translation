@@ -3,8 +3,9 @@ from namedtensor import ntorch, NamedTensor
 import numpy as np
 import random
 
+# based on https://github.com/bentrevett/pytorch-seq2seq/blob/master/1%20-%20Sequence%20to%20Sequence%20Learning%20with%20Neural%20Networks.ipynb
 class LSTMEncoder(ntorch.nn.Module):
-    def __init__(self, DE, emb_dim, hid_dim, n_layers, dropout):
+    def __init__(self, DE, emb_dim, hid_dim, n_layers, dropout, attention = False):
         super().__init__()
 
         self.input_dim = len(DE.vocab)
@@ -12,16 +13,39 @@ class LSTMEncoder(ntorch.nn.Module):
         self.hid_dim = hid_dim
         self.n_layers = n_layers
         self.dropout = dropout
+        self.attention = attention
 
         self.embedding = ntorch.nn.Embedding(self.input_dim, self.emb_dim).spec('srcSeqlen','embedding')
-
         self.rnn = ntorch.nn.LSTM(self.emb_dim, self.hid_dim, self.n_layers, dropout=self.dropout).spec("embedding", "srcSeqlen", "lstm")
-
         self.dropout = ntorch.nn.Dropout(dropout)
 
     def forward(self, x):
         x = x[{'srcSeqlen':slice(-1,0)}]
         x = self.dropout(self.embedding(x))
+        outputs, (hidden, cell) = self.rnn(x)
+        return hidden, cell
+
+class AttentionEncoder(ntorch.nn.Module):
+    def __init__(self, DE, emb_dim, hid_enc_dim, hid_dec_dim, en n_layers, dropout, attention = False):
+        super().__init__()
+
+        self.input_dim = len(DE.vocab)
+        self.emb_dim = emb_dim
+        self.hid_enc_dim = hid_dim
+        self.hid_dec_dim
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.attention = attention
+
+        self.embedding = ntorch.nn.Embedding(self.input_dim, self.emb_dim).spec('srcSeqlen','embedding')
+        self.rnn = (ntorch.nn.LSTM(self.emb_dim, self.hid_enc_dim, self.n_layers, dropout=self.dropout, bidirectional=True)
+        .spec("embedding", "srcSeqlen", "lstm_enc"))
+        self.fc = ntorch.linear(self.hid_enc_dim*2, self.hid_dec_dim).spec("lstm_enc", "lstm_dec")
+        self.dropout = ntorch.nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.dropout(x)
         outputs, (hidden, cell) = self.rnn(x)
         return hidden, cell
 
@@ -64,23 +88,16 @@ class Seq2Seq(ntorch.nn.Module):
         assert encoder.n_layers == decoder.n_layers, "Encoder and decoder must have equal number of layers!"
 
     def forward(self, src, trg, teacher_forcing_ratio=0.5):
-        trg_vocab_size = self.decoder.output_dim
+        outputs = torch.zeros(trg.shape['trgSeqlen']-1 trg.shape['batch'], self.decoder.output_dim).to(self.device)
 
-        #tensor to store decoder outputs
-        outputs = torch.zeros(trg.shape['trgSeqlen'], trg.shape['batch'], trg_vocab_size).to(self.device)
-
-        #last hidden state of the encoder is used as the initial hidden state of the decoder
         hidden, cell = self.encoder(src)
 
-        #first input to the decoder is the <sos> tokens
-        inpt = trg[{'trgSeqlen': slice(0,1)}]
-
-        for t in range(1, trg.shape['trgSeqlen']):
-            output, hidden, cell = self.decoder(inpt, hidden, cell)
+        input = trg[{'trgSeqlen': slice(0,1)}]
+        for t in range(trg.shape['trgSeqlen']-1):
+            output, hidden, cell = self.decoder(input, hidden, cell)
             outputs[t] = output[{'trgSeqlen':0}].values
-            top1 = output.max("out")[1]
-            teacher_force = random.random() < teacher_forcing_ratio
-            inpt = (trg[{'trgSeqlen':slice(t,t+1)}] if teacher_force else top1)
+            _, top1 = output.max("out")
+            input = (trg[{'trgSeqlen':slice(t,t+1)}] if random.random() < teacher_forcing_ratio else top1)
         outputs = NamedTensor(outputs, names = ('trgSeqlen', 'batch', 'out'))
         return outputs
 
@@ -97,16 +114,11 @@ class Seq2Seq(ntorch.nn.Module):
             running_loss = 0.0
             self.train()
             for i, data in enumerate(train_iter, 0):
-                # get the inputs
                 src, trg = data.src, data.trg
-
-                # zero the parameter gradients
                 optimizer.zero_grad()
-
-                # forward + backward + optimize
                 out = self(src, trg)
                 loss = criterion(
-                    out[{"trgSeqlen":slice(1,out.shape["trgSeqlen"])}].transpose("batch", "out", "trgSeqlen").values,
+                    out.transpose("batch", "out", "trgSeqlen").values,
                     trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values,
                 )
                 loss.backward()
@@ -130,7 +142,7 @@ class Seq2Seq(ntorch.nn.Module):
                 src, trg = data.src, data.trg
                 out = self(src, trg, teacher_forcing_ratio = 0)
                 loss = criterion(
-                    out[{"trgSeqlen":slice(1,out.shape["trgSeqlen"])}].transpose("batch", "out", "trgSeqlen").values,
+                    out.transpose("batch", "out", "trgSeqlen").values,
                     trg[{"trgSeqlen":slice(1,trg.shape["trgSeqlen"])}].transpose("batch", "trgSeqlen").values,
                 )
                 running_loss += loss.item()
