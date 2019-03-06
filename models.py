@@ -228,12 +228,13 @@ class Translator(ntorch.nn.Module):
     
     def nll_loss(self, pred, target, pad_token=1):
         """ Computes the correct NLL without counting padding tokens """
-        criterion = torch.nn.NLLLoss(reduction='sum')
+        criterion = torch.nn.NLLLoss(reduction='none')
         pred = pred.transpose('batch', 'logit', 'trgSeqlen').values
         target = target[{'trgSeqlen':slice(1,pred.shape[-1]+1)}].transpose('batch', 'trgSeqlen').values
+        real_tokens = (target != pad_token).to(torch.float)
         loss = criterion(pred, target)
-        real_token_count = (target != pad_token).to(torch.int).sum()
-        return loss / real_token_count
+        loss *= real_tokens
+        return loss.sum() / real_tokens.sum()
 
     def evaluate(self, iter, beam_width=1, beam_len=3):
         self.eval()
